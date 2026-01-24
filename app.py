@@ -1,87 +1,192 @@
 import os
+import time
+import unicodedata
+from threading import Lock
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage as LineTextMessage,
+)
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import google.generativeai as genai
-import pycld2 as cld2
 import langid
 from dotenv import load_dotenv
-# conda activate c:/Users/dakin/Desktop/LGBoT/.conda
 
-# 載入環境變數
+# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# 設定 Line Bot API
-line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
+# Configure Line Bot API (v3)
+configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-# 設定 Gemini API
+# Reuse LINE API client (keep Flask single-thread or single worker for safety)
+_line_api_client = ApiClient(configuration)
+_line_bot_api = MessagingApi(_line_api_client)
+
+# Configure Gemini API
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
+
+# Simple in-memory cache with TTL
+CACHE_TTL_SECONDS = 30 * 60
+_cache_lock = Lock()
+_cache = {}  # (lang, text) -> (timestamp, translated_text)
+_cache_max_size = 512
+
+
+def _cache_get(key):
+    now = time.time()
+    with _cache_lock:
+        item = _cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if now - ts > CACHE_TTL_SECONDS:
+            _cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(key, value):
+    now = time.time()
+    with _cache_lock:
+        if len(_cache) >= _cache_max_size:
+            # Drop the oldest item to cap memory
+            oldest_key = min(_cache.items(), key=lambda kv: kv[1][0])[0]
+            _cache.pop(oldest_key, None)
+        _cache[key] = (now, value)
+
+
+def _is_emoji_codepoint(ch):
+    cp = ord(ch)
+    if cp in (0x200D, 0xFE0F):
+        return True
+    if 0x1F300 <= cp <= 0x1FAFF:
+        return True
+    if 0x2600 <= cp <= 0x27BF:
+        return True
+    if 0x2300 <= cp <= 0x23FF:
+        return True
+    return unicodedata.category(ch) == "So"
+
+
+def _mask_emojis(text):
+    masked = []
+    mapping = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if _is_emoji_codepoint(ch):
+            start = i
+            i += 1
+            while i < len(text) and _is_emoji_codepoint(text[i]):
+                i += 1
+            emoji_seq = text[start:i]
+            placeholder = f"<EMOJI_{len(mapping)}>"
+            mapping.append((placeholder, emoji_seq))
+            masked.append(placeholder)
+            continue
+        masked.append(ch)
+        i += 1
+    return "".join(masked), mapping
+
 
 def detect_language(text):
-    # try:
-    #     isReliable, textBytesFound, details = cld2.detect(text)
-    #     if isReliable:
-    #         lang_code = details[0][1]  # 例如 'zh-Hant', 'zh-Hans', 'en'
-    #         return lang_code.lower()
+    """Detect the language of the input text."""
     try:
         lang, confidence = langid.classify(text)
-        return lang  # 返回語言代碼，例如 'zh', 'en'
+        return lang  # Example values: 'zh', 'en'
     except Exception:
         pass
     return "unknown"
 
+
 def translate_text(text):
+    """Translate text using Gemini."""
     try:
-        # 檢測輸入文字的語言
+        # Detect input language
         lang = detect_language(text)
-        
+
+        cache_key = (lang, text)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        masked_text, emoji_map = _mask_emojis(text)
+
         if lang.startswith('zh'):
-            # 如果是中文，翻譯成英文
-            prompt = f"請將以下中文翻譯成英文，只需要回覆一個版本的翻譯結果：\n{text}"
+            # Translate to English if input is Chinese
+            prompt = (
+                "Translate into modern, casual English. "
+                "Return a single best translation only. "
+                "No lists, no numbering, no explanations. "
+                "Do not change placeholders like <EMOJI_0>.\n"
+                f"{masked_text}"
+            )
         else:
-            # 如果是其他語言，翻譯成中文
-            prompt = f"請將以下文字翻譯成繁體中文，只需要回覆一個版本的翻譯結果：\n{text}"
-        
+            # Translate to Chinese if input is not Chinese
+            prompt = (
+                "Translate into modern, casual Traditional Chinese. "
+                "Return a single best translation only. "
+                "No lists, no numbering, no explanations. "
+                "Do not change placeholders like <EMOJI_0>.\n"
+                f"{masked_text}"
+            )
+
         response = model.generate_content(prompt)
-        return response.text.strip()
-    
+        translated = response.text.strip()
+        for placeholder, emoji_seq in emoji_map:
+            translated = translated.replace(placeholder, emoji_seq)
+        _cache_set(cache_key, translated)
+        return translated
+
     except Exception as e:
-        return f"翻譯時發生錯誤：{str(e)}"
+        return f"Translation error: {str(e)}"
+
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    # 取得 X-Line-Signature header 的值
-    signature = request.headers['X-Line-Signature']
+    """LINE Webhook callback."""
+    # Get X-Line-Signature header
+    signature = request.headers.get('X-Line-Signature', '')
 
-    # 取得請求內容
+    # Get request body text
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        app.logger.warning("Invalid signature. Please check your channel secret.")
         abort(400)
 
     return 'OK'
 
-@handler.add(MessageEvent, message=TextMessage)
+
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    # 取得使用者傳送的訊息
+    """Handle incoming text messages."""
+    # Get incoming user message text
     user_message = event.message.text
-    
-    # 進行翻譯
+
+    # Translate text
     translated_text = translate_text(user_message)
-    
-    # 回傳翻譯結果
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=translated_text)
+
+    # Send translated reply
+    _line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[LineTextMessage(text=translated_text)],
+        )
     )
 
+
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000) 
+    app.run(host='0.0.0.0', port=5000)
