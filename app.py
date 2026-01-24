@@ -1,6 +1,5 @@
 import os
 import time
-import unicodedata
 from threading import Lock
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -64,39 +63,6 @@ def _cache_set(key, value):
         _cache[key] = (now, value)
 
 
-def _is_emoji_codepoint(ch):
-    cp = ord(ch)
-    if cp in (0x200D, 0xFE0F):
-        return True
-    if 0x1F300 <= cp <= 0x1FAFF:
-        return True
-    if 0x2600 <= cp <= 0x27BF:
-        return True
-    if 0x2300 <= cp <= 0x23FF:
-        return True
-    return unicodedata.category(ch) == "So"
-
-
-def _mask_emojis(text):
-    masked = []
-    mapping = []
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if _is_emoji_codepoint(ch):
-            start = i
-            i += 1
-            while i < len(text) and _is_emoji_codepoint(text[i]):
-                i += 1
-            emoji_seq = text[start:i]
-            placeholder = f"<EMOJI_{len(mapping)}>"
-            mapping.append((placeholder, emoji_seq))
-            masked.append(placeholder)
-            continue
-        masked.append(ch)
-        i += 1
-    return "".join(masked), mapping
-
 
 def detect_language(text):
     """Detect the language of the input text."""
@@ -119,16 +85,14 @@ def translate_text(text):
         if cached is not None:
             return cached
 
-        masked_text, emoji_map = _mask_emojis(text)
-
         if lang.startswith('zh'):
             # Translate to English if input is Chinese
             prompt = (
                 "Translate into modern, casual English. "
                 "Return a single best translation only. "
                 "No lists, no numbering, no explanations. "
-                "Do not change placeholders like <EMOJI_0>.\n"
-                f"{masked_text}"
+                "Keep meaning, tone, and punctuation.\n"
+                f"{text}"
             )
         else:
             # Translate to Chinese if input is not Chinese
@@ -136,14 +100,12 @@ def translate_text(text):
                 "Translate into modern, casual Traditional Chinese. "
                 "Return a single best translation only. "
                 "No lists, no numbering, no explanations. "
-                "Do not change placeholders like <EMOJI_0>.\n"
-                f"{masked_text}"
+                "Keep meaning, tone, and punctuation.\n"
+                f"{text}"
             )
 
         response = model.generate_content(prompt)
         translated = response.text.strip()
-        for placeholder, emoji_seq in emoji_map:
-            translated = translated.replace(placeholder, emoji_seq)
         _cache_set(cache_key, translated)
         return translated
 
