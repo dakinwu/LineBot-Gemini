@@ -1,50 +1,91 @@
-# Line 翻譯機器人
+# LineBot-Gemini（實際用途版）
 
-這是一個使用 Line Messaging API 和 Google Gemini API 實作的翻譯機器人。它可以自動檢測輸入的文字語言：
-- 如果輸入中文，會翻譯成英文
-- 如果輸入其他語言，會翻譯成中文
+這是一個本地運行的 LINE Bot 專案：當使用者貼上 LINE VOOM 文章網址時，程式會用 Playwright 開啟瀏覽器下載該貼文的圖片，接著用 Gemini Vision 進行分析，並把結果回傳到 LINE。
 
-## 安裝需求
+此專案偏向「個人/小團隊工具」，不保證長期穩定，VOOM 網頁結構改版就可能需要調整 selector。
 
-1. Python 3.7 或更新版本
-2. Line Messaging API 帳號和頻道
-3. Google Cloud 帳號和 API 金鑰
+## 主要功能
+- 接收 LINE 訊息，抓出 VOOM 連結
+- 用 Playwright 開啟瀏覽器並下載 VOOM 圖片
+- 將圖片餵給 Gemini Vision 分析並回覆文字結果
+- 支援長訊息切段回覆（超過 LINE 限制時改用 push）
 
-## 設置步驟
+## 環境需求
+- Python 3.8+（建議 3.10 以上）
+- 已啟用 LINE Messaging API 的 Channel
+- Google Gemini API Key
+- Windows/macOS/Linux 皆可（本專案目前以 Windows 實測為主）
 
-1. 安裝相依套件：
-   ```bash
-   pip install -r requirements.txt
-   ```
+## 安裝
+```bash
+pip install -r requirements.txt
+```
 
-2. 複製 `.env.example` 到 `.env`：
-   ```bash
-   cp .env.example .env
-   ```
+## 環境變數
+建立 `.env`，內容如下：
+```
+LINE_CHANNEL_ACCESS_TOKEN=你的LINE_ACCESS_TOKEN
+LINE_CHANNEL_SECRET=你的LINE_CHANNEL_SECRET
+GOOGLE_API_KEY=你的GOOGLE_API_KEY
 
-3. 在 `.env` 檔案中填入您的：
-   - LINE_CHANNEL_ACCESS_TOKEN
-   - LINE_CHANNEL_SECRET
-   - GOOGLE_API_KEY
+# 可選
+GEMINI_VISION_MODEL=gemini-2.5-flash
+```
 
-4. 啟動應用程式：
-   ```bash
-   python app.py
-   ```
+## 啟動
+```bash
+python app.py
+```
 
-5. 使用 ngrok 或其他工具將應用程式公開到網際網路
+預設會在 `http://0.0.0.0:5000` 啟動。
 
-6. 在 Line Developers Console 中設定 Webhook URL：
-   - URL 格式：`https://您的網域/callback`
+## Line Webhook 設定
+你需要把外部可存取的 URL 指向 `/callback`，例如：
+```
+https://<your-domain-or-ngrok>/callback
+```
+
+本地測試可用 ngrok：
+```bash
+ngrok http 5000
+```
 
 ## 使用方式
+在 LINE 對話中貼上 VOOM 貼文網址，例如：
+```
+https://voom.line.me/post/xxxxxxxx
+```
+或
+```
+https://linevoom.line.me/post/xxxxxxxx
+```
 
-1. 將機器人加入為好友
-2. 傳送任何文字訊息給機器人
-3. 機器人會自動檢測語言並進行翻譯
+Bot 會回覆該貼文圖片的分析結果。
 
-## 注意事項
+## 單獨使用 VOOM 下載器
+你可以直接執行：
+```bash
+python voom_downloader.py <VOOM 文章網址>
+```
+下載的圖片會放在 `voom_images/`。
 
-- 請確保您的 API 金鑰安全，不要公開或上傳到版本控制系統
-- 建議在正式環境中使用 HTTPS
-- 確保您的伺服器有足夠的記憶體和處理能力 
+## 注意事項（很現實的部分）
+- Playwright 目前使用「有 UI 的瀏覽器模式」；如果你關掉瀏覽器視窗，流程會中斷。
+- VOOM DOM 變動很頻繁，`voom_downloader.py` 的 selector 可能失效。
+- 如果貼文需要登入才能看，Playwright 會卡住或抓不到圖。
+- 下載與分析都需要時間，LINE reply 有數量與長度限制，所以會拆段回覆。
+
+## 常見問題
+- **抓不到圖片**：通常是 selector 失效或貼文被登入限制，請更新 `voom_downloader.py` 的 selector。
+- **TargetClosedError**：表示瀏覽器/頁面被關閉或崩潰，重新開啟再試。
+- **Gemini 回傳很慢**：視圖片張數與模型而定，可嘗試限制圖片數量或改用較快模型。
+
+## 目錄結構
+```
+LineBot-Gemini/
+├─ app.py                # LINE Bot 主程式
+├─ voom_downloader.py    # VOOM 圖片下載器（Playwright）
+├─ voom_images/          # 下載後的圖片
+├─ requirements.txt
+└─ .env                  # 環境變數（自行建立）
+```
