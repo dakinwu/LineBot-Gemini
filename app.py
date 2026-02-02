@@ -191,7 +191,13 @@ def _create_notion_page(title, content, voom_url, analyzed_at):
             "object": "block",
             "type": "paragraph",
             "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": f"VOOM 連結: {voom_url}"}}],
+                "rich_text": [
+                    {"type": "text", "text": {"content": "VOOM 連結: "}},
+                    {
+                        "type": "text",
+                        "text": {"content": voom_url, "link": {"url": voom_url}},
+                    },
+                ],
             },
         },
         {
