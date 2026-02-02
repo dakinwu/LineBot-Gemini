@@ -3,7 +3,9 @@ import re
 import mimetypes
 import subprocess
 import sys
+from datetime import datetime
 from flask import Flask, request, abort
+import requests
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -38,6 +40,13 @@ model = genai.GenerativeModel(VISION_MODEL_NAME)
 
 VOOM_IMAGES_DIR = "voom_images"
 MAX_VOOM_IMAGES = None
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_PARENT_PAGE = (
+    os.getenv("NOTION_PARENT_PAGE_URL")
+    or os.getenv("NOTION_PARENT_PAGE_ID")
+    or "https://www.notion.so/1ecb98676e4e806d8480eaefa758945f"
+)
+NOTION_VERSION = "2022-06-28"
 
 def _clear_voom_images():
     os.makedirs(VOOM_IMAGES_DIR, exist_ok=True)
@@ -52,6 +61,167 @@ def _extract_first_url(text):
         return None
     url = match.group(1)
     return url.rstrip(").,;，。】》>」")
+
+def _extract_notion_page_id(value):
+    if not value:
+        return None
+    match = re.search(r"([0-9a-fA-F]{32})", value)
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+
+def _notion_headers():
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+def _chunk_text(text, limit=1800):
+    if not text:
+        return []
+    chunks = []
+    current = ""
+    for ch in text:
+        if len(current) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        current += ch
+    if current:
+        chunks.append(current)
+    return chunks
+
+def _rich_text_from_markdown(text):
+    parts = []
+    pattern = re.compile(r"\*\*(.+?)\*\*")
+    last = 0
+    for match in pattern.finditer(text):
+        if match.start() > last:
+            parts.append({"type": "text", "text": {"content": text[last:match.start()]}})
+        bold_text = match.group(1)
+        if bold_text:
+            parts.append({
+                "type": "text",
+                "text": {"content": bold_text},
+                "annotations": {"bold": True},
+            })
+        last = match.end()
+    if last < len(text):
+        parts.append({"type": "text", "text": {"content": text[last:]}})
+    return parts or [{"type": "text", "text": {"content": ""}}]
+
+def _text_blocks_from_content(content):
+    blocks = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": []},
+            })
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        number_match = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+        bullet_match = re.match(r"^[-*•]\s+(.+)$", stripped)
+
+        if heading_match:
+            raw_level = len(heading_match.group(1))
+            if raw_level <= 2:
+                level = raw_level
+            else:
+                level = 2
+            text = heading_match.group(2)
+            block_type = f"heading_{level}"
+            for chunk in _chunk_text(text):
+                blocks.append({
+                    "object": "block",
+                    "type": block_type,
+                    block_type: {
+                        "rich_text": _rich_text_from_markdown(chunk),
+                    },
+                })
+            continue
+
+        if number_match:
+            text = number_match.group(2)
+            for chunk in _chunk_text(text):
+                blocks.append({
+                    "object": "block",
+                    "type": "numbered_list_item",
+                    "numbered_list_item": {
+                        "rich_text": _rich_text_from_markdown(chunk),
+                    },
+                })
+            continue
+
+        if bullet_match:
+            text = bullet_match.group(1)
+            for chunk in _chunk_text(text):
+                blocks.append({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": _rich_text_from_markdown(chunk),
+                    },
+                })
+            continue
+
+        for chunk in _chunk_text(stripped):
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": _rich_text_from_markdown(chunk),
+                },
+            })
+    return blocks
+
+def _create_notion_page(title, content, voom_url, analyzed_at):
+    if not NOTION_TOKEN:
+        raise ValueError("NOTION_TOKEN 未設定")
+    parent_id = _extract_notion_page_id(NOTION_PARENT_PAGE)
+    if not parent_id:
+        raise ValueError("NOTION_PARENT_PAGE_URL/ID 未設定或格式不正確")
+
+    header_blocks = [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": f"VOOM 連結: {voom_url}"}}],
+            },
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": []},
+        },
+    ]
+
+    payload = {
+        "parent": {"page_id": parent_id},
+        "properties": {
+            "title": {
+                "title": [{"type": "text", "text": {"content": title}}],
+            }
+        },
+        "children": header_blocks + _text_blocks_from_content(content),
+    }
+
+    resp = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=_notion_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Notion API 錯誤 {resp.status_code}: {resp.text}")
+    data = resp.json()
+    page_url = data.get("url")
+    return page_url
 
 def _download_voom_images(url):
     _clear_voom_images()
@@ -87,7 +257,7 @@ def _image_part(path):
 
 def analyze_voom_images(image_paths):
     if not image_paths:
-        return "????????????? VOOM ?????????"
+        return "找不到圖片，無法分析 VOOM 貼文。"
 
     image_labels = [f"圖{i+1}: {os.path.basename(p)}" for i, p in enumerate(image_paths)]
     prompt = (
@@ -154,7 +324,28 @@ def analyze_voom_images(image_paths):
         parts.append(_image_part(path))
 
     response = model.generate_content(parts)
-    return response.text.strip()
+    try:
+        return response.text.strip()
+    except Exception:
+        texts = []
+        try:
+            for part in response.parts:
+                if getattr(part, "text", None):
+                    texts.append(part.text)
+        except Exception:
+            texts = []
+        if not texts:
+            try:
+                for cand in response.candidates or []:
+                    content = getattr(cand, "content", None)
+                    if not content:
+                        continue
+                    for part in content.parts or []:
+                        if getattr(part, "text", None):
+                            texts.append(part.text)
+            except Exception:
+                texts = []
+        return "\n".join(texts).strip()
 
 def _sentence_split(text):
     # Keep punctuation as sentence endings; include newline as a boundary.
@@ -212,23 +403,27 @@ def handle_message(event):
     print(f"[debug] Extracted URL: {url!r}", flush=True)
 
     if not url or not ("voom.line.me" in url or "linevoom.line.me" in url):
-        reply_text = "??? LINE VOOM ??????? https://voom.line.me/post/... ? https://linevoom.line.me/post/...??"
+        reply_text = "請提供 LINE VOOM 文章網址，例如 https://voom.line.me/post/... 或 https://linevoom.line.me/post/..."
     else:
         try:
             result = _download_voom_images(url)
             if result.returncode != 0:
                 reply_text = (
-                    "?????????? VOOM ????????????\n"
-                    f"???{(result.stderr or result.stdout).strip()}"
+                    "下載 VOOM 圖片失敗。\n"
+                    f"錯誤訊息：{(result.stderr or result.stdout).strip()}"
                 )
             else:
                 image_paths = _load_voom_images()
                 if not image_paths:
-                    reply_text = "????????????? VOOM ?????????"
+                    reply_text = "找不到圖片，無法分析 VOOM 貼文。"
                 else:
-                    reply_text = analyze_voom_images(image_paths)
+                    analysis_text = analyze_voom_images(image_paths)
+                    analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    title = f"{analyzed_at} 晨報整理"
+                    notion_url = _create_notion_page(title, analysis_text, url, analyzed_at)
+                    reply_text = f"已建立 Notion 頁面：{notion_url}"
         except Exception as e:
-            reply_text = f"?????{str(e)}"
+            reply_text = f"處理失敗：{str(e)}"
 
     chunks = split_text_for_line(reply_text, limit=4900)
     messages = [LineTextMessage(text=chunk) for chunk in chunks]

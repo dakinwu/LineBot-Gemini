@@ -129,15 +129,22 @@ with sync_playwright() as p:
     index = 1
 
     # 一律點開檢視器，逐張按下一頁
-    # 點進第一張主圖：優先點圖本身（img.media_image），其次點容器
-    # 只點主貼文的媒體圖，排除頭像 img.image
-    target = page.query_selector(".media_top_inner .media_box_layout .media_item_type_viewer img.media_image")
+    # 點進第一張主圖：鎖定 viewer 內的 media_image（避免頭像 img.image）
+    target = page.query_selector(
+        ".vw_viewer_content_wrap .media_layout .swiper-slide-active "
+        ".media_item.type_viewer img.media_image"
+    )
     if not target:
-        target = page.query_selector(".media_top_inner .media_box_layout .media_item_type_viewer")
+        target = page.query_selector(
+            ".vw_viewer_content_wrap .media_layout .swiper-slide-active "
+            ".media_item.type_viewer"
+        )
     if not target:
-        target = page.query_selector(".media_top_inner .media_layout img.media_image")
+        target = page.query_selector(
+            ".vw_viewer_content_wrap .media_layout img.media_image"
+        )
     if not target:
-        target = page.query_selector(".media_top_inner .media_layout")
+        target = page.query_selector(".vw_viewer_content_wrap .media_layout")
     if not target:
         target = page.query_selector(".media_top_inner img.media_image")
     if not target:
