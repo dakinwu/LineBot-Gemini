@@ -39,6 +39,20 @@ def pick_largest_image(page, candidates):
             continue
     return best
 
+def safe_click(element, label):
+    if not element:
+        return False
+    try:
+        element.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+    try:
+        element.click(timeout=2000, force=True)
+        return True
+    except Exception as e:
+        print(f"[warn] 點擊失敗 ({label}): {e}")
+        return False
+
 def get_active_viewer_info(page):
     # Prefer the active swiper slide image inside the viewer
     active_slide = page.query_selector(".vw_media_viewer .swiper-slide-active")
@@ -151,7 +165,7 @@ with sync_playwright() as p:
         all_imgs = page.query_selector_all("article img, main img, img")
         target = pick_largest_image(page, all_imgs)
     if target:
-        target.click()
+        safe_click(target, "open_viewer_target")
     else:
         print("找不到可點擊的圖片，請確認網址是否為單一文章。")
         browser.close()
@@ -185,8 +199,11 @@ with sync_playwright() as p:
         prev_src = src
         prev_idx = idx
         print("按鍵盤右鍵切換")
-        if img:
-            img.click()
+        viewer = page.query_selector(".vw_media_viewer")
+        if viewer:
+            safe_click(viewer, "viewer")
+        elif img:
+            safe_click(img, "active_image")
         page.keyboard.press("ArrowRight")
 
         # 等待 0.5 秒後判斷是否切換成功

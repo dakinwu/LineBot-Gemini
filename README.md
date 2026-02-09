@@ -10,6 +10,7 @@
 - 將圖片餵給 Gemini Vision 分析並產生文字結果
 - 結果寫入 Notion（標題含分析時間），LINE 回傳 Notion 連結
 - 內文支援簡易 Markdown 轉 Notion 區塊（標題/清單/粗體）
+ - 支援晨報/盤後報告模式（訊息前綴 1=晨報、2=盤後報告）
 
 ## 環境需求
 - Python 3.8+（建議 3.10 以上）
@@ -35,15 +36,24 @@ GEMINI_VISION_MODEL=gemini-2.5-flash
 
 # Notion
 NOTION_TOKEN=你的NOTION_INTEGRATION_SECRET
+# 可選：分晨報/盤後兩個父頁，不設定會回退到 NOTION_PARENT_PAGE_URL
+NOTION_PARENT_PAGE_MORNING_URL=https://www.notion.so/xxxx
+NOTION_PARENT_PAGE_AFTER_HOURS_URL=https://www.notion.so/yyyy
 NOTION_PARENT_PAGE_URL=https://www.notion.so/1ecb98676e4e806d8480eaefa758945f
 ```
 
 ## 啟動
+使用 Uvicorn（支援 `--reload`）：
+```bash
+uvicorn app:app --reload --host 0.0.0.0 --port 5000
+```
+
+或直接執行（無 reload）：
 ```bash
 python app.py
 ```
 
-預設會在 `http://0.0.0.0:5000` 啟動。
+預設會在 `http://0.0.0.0:5000` 啟動（若用 `uvicorn app:app --reload` 未指定 `--port`，預設為 8000）。
 
 ## Line Webhook 設定
 你需要把外部可存取的 URL 指向 `/callback`，例如：
@@ -68,6 +78,10 @@ https://linevoom.line.me/post/xxxxxxxx
 
 Bot 會建立一個 Notion 頁面，並回覆該頁面連結。
 
+可在訊息前綴加入模式：
+- `1` = 晨報
+- `2` = 盤後報告
+
 ## 單獨使用 VOOM 下載器
 你可以直接執行：
 ```bash
@@ -91,7 +105,7 @@ python voom_downloader.py <VOOM 文章網址>
 ## 目錄結構
 ```
 LineBot-Gemini/
-├─ app.py                # LINE Bot 主程式
+├─ app.py                # LINE Bot 主程式（FastAPI）
 ├─ voom_downloader.py    # VOOM 圖片下載器（Playwright）
 ├─ voom_images/          # 下載後的圖片
 ├─ requirements.txt
