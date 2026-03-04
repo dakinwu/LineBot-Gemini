@@ -12,7 +12,10 @@ import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from google.api_core import exceptions as google_exceptions
 import google.generativeai as genai
+from google.generativeai import client as genai_client
+from google.generativeai.types import generation_types
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -25,9 +28,9 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import requests
+import uvicorn
 
 from prompts import after_hours_report_prompt, morning_report_prompt
-import uvicorn
 
 # Load environment variables
 load_dotenv()
@@ -36,6 +39,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+
+def _get_env_int(name, default=None):
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %r", name, raw, default)
+        return default
+
+
+def _get_env_float(name, default):
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %r", name, raw, default)
+        return default
 
 # Configure Line Bot API (v3)
 configuration = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
@@ -48,10 +73,14 @@ _line_bot_api = MessagingApi(_line_api_client)
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 VISION_MODEL_NAME = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SECONDS = _get_env_float("GEMINI_TIMEOUT_SECONDS", 180.0)
+GEMINI_MAX_RETRIES = max(0, _get_env_int("GEMINI_MAX_RETRIES", 2))
+GEMINI_RETRY_BASE_DELAY = _get_env_float("GEMINI_RETRY_BASE_DELAY", 2.0)
+GEMINI_IMAGE_BATCH_SIZE = max(1, _get_env_int("GEMINI_IMAGE_BATCH_SIZE", 3))
 model = genai.GenerativeModel(VISION_MODEL_NAME)
 
 VOOM_IMAGES_DIR = "voom_images"
-MAX_VOOM_IMAGES = None
+MAX_VOOM_IMAGES = _get_env_int("MAX_VOOM_IMAGES")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_PARENT_PAGE_MORNING = os.getenv("NOTION_PARENT_PAGE_MORNING_URL")
 NOTION_PARENT_PAGE_AFTER_HOURS = os.getenv("NOTION_PARENT_PAGE_AFTER_HOURS_URL")
@@ -313,7 +342,7 @@ def _create_notion_page(title, content, voom_url, parent_page):
         batch = remaining[:NOTION_APPEND_BATCH_SIZE]
         remaining = remaining[NOTION_APPEND_BATCH_SIZE:]
         append_resp = _notion_request(
-            "POST",
+            "PATCH",
             f"https://api.notion.com/v1/blocks/{page_id}/children",
             {"children": batch},
         )
@@ -371,6 +400,143 @@ def _analysis_title(mode, analyzed_at):
     return f"{analyzed_at} 盤後整理" if mode == "after_hours" else f"{analyzed_at} 晨報整理"
 
 
+def _analysis_prompt(prompt_template, image_paths, start_index=0):
+    image_labels = [
+        f"Image {i + start_index + 1}: {os.path.basename(path)}"
+        for i, path in enumerate(image_paths)
+    ]
+    prompt = prompt_template.replace("{image_labels}", "\n".join(image_labels))
+    return prompt, image_labels
+
+
+def _batched_image_paths(image_paths, batch_size):
+    for start in range(0, len(image_paths), batch_size):
+        yield start, image_paths[start:start + batch_size]
+
+
+def _extract_generation_text(response):
+    try:
+        return response.text.strip()
+    except Exception:
+        texts = []
+        try:
+            for part in response.parts:
+                if getattr(part, "text", None):
+                    texts.append(part.text)
+        except Exception:
+            texts = []
+        if not texts:
+            try:
+                for cand in response.candidates or []:
+                    content = getattr(cand, "content", None)
+                    if not content:
+                        continue
+                    for part in content.parts or []:
+                        if getattr(part, "text", None):
+                            texts.append(part.text)
+            except Exception:
+                texts = []
+        return "\n".join(texts).strip()
+
+
+def _generate_gemini_response(parts):
+    request = model._prepare_request(contents=parts)
+    if model._client is None:
+        model._client = genai_client.get_default_generative_client()
+
+    last_err = None
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            raw_response = model._client.generate_content(
+                request=request,
+                timeout=GEMINI_TIMEOUT_SECONDS,
+            )
+            return generation_types.GenerateContentResponse.from_response(raw_response)
+        except (
+            google_exceptions.DeadlineExceeded,
+            google_exceptions.InternalServerError,
+            google_exceptions.ServiceUnavailable,
+        ) as err:
+            last_err = err
+            if attempt >= GEMINI_MAX_RETRIES:
+                raise
+            delay = GEMINI_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "Gemini request failed with %s; retrying in %.1fs (%s/%s)",
+                type(err).__name__,
+                delay,
+                attempt + 1,
+                GEMINI_MAX_RETRIES,
+            )
+            time.sleep(delay)
+
+    raise last_err
+
+
+def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
+    batch_reports = []
+    for batch_number, (start_index, batch_paths) in enumerate(
+        _batched_image_paths(image_paths, GEMINI_IMAGE_BATCH_SIZE),
+        start=1,
+    ):
+        batch_prompt, batch_labels = _analysis_prompt(
+            prompt_template,
+            batch_paths,
+            start_index=start_index,
+        )
+        batch_prompt = (
+            f"{batch_prompt}\n\n"
+            "You are only receiving this subset of images from the same LINE VOOM post. "
+            "Analyze only these images and do not invent details from images that are not shown."
+        )
+        batch_parts = [batch_prompt]
+        for path in batch_paths:
+            batch_parts.append(_image_part(path))
+        batch_response = _generate_gemini_response(batch_parts)
+        batch_text = _extract_generation_text(batch_response)
+        batch_reports.append(
+            f"Batch {batch_number} ({', '.join(batch_labels)}):\n{batch_text}"
+        )
+
+    if len(batch_reports) == 1:
+        return batch_reports[0]
+
+    synthesis_prompt = (
+        "The following are partial analyses from multiple image batches of the same LINE VOOM post.\n"
+        "Combine them into one final report.\n"
+        "Do not mention batching, missing images, or the analysis process.\n"
+        "Remove duplication and keep only grounded details.\n\n"
+        f"Original instructions:\n{full_prompt}\n\n"
+        "Partial analyses:\n"
+        f"{chr(10).join(batch_reports)}"
+    )
+    synthesis_response = _generate_gemini_response([synthesis_prompt])
+    return _extract_generation_text(synthesis_response)
+
+
+def _analyze_voom_images_with_retry(image_paths, prompt_template):
+    if not image_paths:
+        return "No VOOM images found."
+
+    prompt, _ = _analysis_prompt(prompt_template, image_paths)
+    parts = [prompt]
+    for path in image_paths:
+        parts.append(_image_part(path))
+
+    try:
+        response = _generate_gemini_response(parts)
+        return _extract_generation_text(response)
+    except google_exceptions.DeadlineExceeded:
+        if len(image_paths) <= 1 or GEMINI_IMAGE_BATCH_SIZE >= len(image_paths):
+            raise
+        logger.warning(
+            "Gemini timed out for %s images; falling back to batches of %s",
+            len(image_paths),
+            GEMINI_IMAGE_BATCH_SIZE,
+        )
+        return _analyze_voom_images_in_batches(image_paths, prompt_template, prompt)
+
+
 def analyze_voom_images(image_paths, prompt_template):
     if not image_paths:
         return "找不到圖片，無法分析 VOOM 貼文。"
@@ -405,6 +571,10 @@ def analyze_voom_images(image_paths, prompt_template):
             except Exception:
                 texts = []
         return "\n".join(texts).strip()
+
+
+# Override the legacy implementation above with the timeout-aware path.
+analyze_voom_images = _analyze_voom_images_with_retry
 
 
 def _sentence_split(text):
