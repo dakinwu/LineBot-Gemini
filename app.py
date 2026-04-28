@@ -30,7 +30,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import requests
 import uvicorn
 
-from prompts import after_hours_report_prompt, morning_report_prompt
+from prompts import after_hours_report_prompt, extract_facts_prompt, morning_report_prompt
 
 # Load environment variables
 load_dotenv()
@@ -288,6 +288,8 @@ def _create_notion_page(title, content, voom_url, parent_page):
         raise ValueError("NOTION_TOKEN 未設定")
     if not parent_page:
         raise ValueError("NOTION_PARENT_PAGE 未設定")
+    if not content or not content.strip():
+        raise ValueError("分析結果是空的，已停止建立 Notion 頁面")
     parent_id = _extract_notion_page_id(parent_page)
     if not parent_id:
         raise ValueError("NOTION_PARENT_PAGE_URL/ID 未設定或格式不正確")
@@ -439,8 +441,42 @@ def _extract_generation_text(response):
         return "\n".join(texts).strip()
 
 
+def _generation_debug_summary(response):
+    details = []
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    if prompt_feedback:
+        details.append(f"prompt_feedback={prompt_feedback}")
+    try:
+        for idx, cand in enumerate(getattr(response, "candidates", None) or [], start=1):
+            finish_reason = getattr(cand, "finish_reason", None)
+            safety_ratings = getattr(cand, "safety_ratings", None)
+            details.append(
+                f"candidate {idx}: finish_reason={finish_reason}, "
+                f"safety_ratings={safety_ratings}"
+            )
+    except Exception as err:
+        details.append(f"candidate_debug_error={type(err).__name__}: {err}")
+    return "; ".join(details) if details else "no response details available"
+
+
+def _extract_generation_text_or_raise(response, context):
+    text = _extract_generation_text(response)
+    if text:
+        return text
+    raise RuntimeError(
+        f"Gemini 沒有回傳可寫入 Notion 的分析文字（{context}）。"
+        f"回應資訊：{_generation_debug_summary(response)}"
+    )
+
+
 def _generate_gemini_response(parts):
-    request = model._prepare_request(contents=parts)
+    request = model._prepare_request(
+        contents=parts,
+        generation_config=None,
+        safety_settings=None,
+        tools=None,
+        tool_config=None,
+    )
     if model._client is None:
         model._client = genai_client.get_default_generative_client()
 
@@ -493,7 +529,10 @@ def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
         for path in batch_paths:
             batch_parts.append(_image_part(path))
         batch_response = _generate_gemini_response(batch_parts)
-        batch_text = _extract_generation_text(batch_response)
+        batch_text = _extract_generation_text_or_raise(
+            batch_response,
+            f"batch {batch_number}",
+        )
         batch_reports.append(
             f"Batch {batch_number} ({', '.join(batch_labels)}):\n{batch_text}"
         )
@@ -502,8 +541,8 @@ def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
         return batch_reports[0]
 
     synthesis_prompt = (
-        "The following are partial analyses from multiple image batches of the same LINE VOOM post.\n"
-        "Combine them into one final report.\n"
+        "The following are partial outputs from multiple image batches of the same LINE VOOM post.\n"
+        "Combine them into one single output that follows the original instructions.\n"
         "Do not mention batching, missing images, or the analysis process.\n"
         "Remove duplication and keep only grounded details.\n\n"
         f"Original instructions:\n{full_prompt}\n\n"
@@ -511,7 +550,7 @@ def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
         f"{chr(10).join(batch_reports)}"
     )
     synthesis_response = _generate_gemini_response([synthesis_prompt])
-    return _extract_generation_text(synthesis_response)
+    return _extract_generation_text_or_raise(synthesis_response, "batch synthesis")
 
 
 def _analyze_voom_images_with_retry(image_paths, prompt_template):
@@ -525,7 +564,7 @@ def _analyze_voom_images_with_retry(image_paths, prompt_template):
 
     try:
         response = _generate_gemini_response(parts)
-        return _extract_generation_text(response)
+        return _extract_generation_text_or_raise(response, "full image analysis")
     except google_exceptions.DeadlineExceeded:
         if len(image_paths) <= 1 or GEMINI_IMAGE_BATCH_SIZE >= len(image_paths):
             raise
@@ -575,6 +614,22 @@ def analyze_voom_images(image_paths, prompt_template):
 
 # Override the legacy implementation above with the timeout-aware path.
 analyze_voom_images = _analyze_voom_images_with_retry
+
+
+def _morning_prompt_from_facts(facts_text):
+    return morning_report_prompt.replace("{facts_table}", facts_text.strip())
+
+
+def analyze_morning_voom_images(image_paths):
+    facts_text = analyze_voom_images(image_paths, extract_facts_prompt)
+    logger.info("Gemini extracted facts text length: %s", len(facts_text or ""))
+
+    synthesis_prompt = _morning_prompt_from_facts(facts_text)
+    synthesis_response = _generate_gemini_response([synthesis_prompt])
+    return _extract_generation_text_or_raise(
+        synthesis_response,
+        "morning report synthesis",
+    )
 
 
 def _sentence_split(text):
@@ -649,9 +704,14 @@ def _process_voom_sync(url, mode):
     images = _load_voom_images()
     if not images:
         raise RuntimeError("找不到圖片，無法分析 VOOM 貼文。")
+    logger.info("Downloaded %s VOOM images for analysis", len(images))
 
-    prompt = _analysis_prompt_template(mode)
-    analysis_text = analyze_voom_images(images, prompt)
+    if mode == "morning":
+        analysis_text = analyze_morning_voom_images(images)
+    else:
+        prompt = _analysis_prompt_template(mode)
+        analysis_text = analyze_voom_images(images, prompt)
+    logger.info("Gemini analysis text length: %s", len(analysis_text or ""))
 
     analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     title = _analysis_title(mode, analyzed_at)
