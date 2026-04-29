@@ -73,10 +73,18 @@ _line_bot_api = MessagingApi(_line_api_client)
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 VISION_MODEL_NAME = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
-GEMINI_TIMEOUT_SECONDS = _get_env_float("GEMINI_TIMEOUT_SECONDS", 180.0)
-GEMINI_MAX_RETRIES = max(0, _get_env_int("GEMINI_MAX_RETRIES", 2))
-GEMINI_RETRY_BASE_DELAY = _get_env_float("GEMINI_RETRY_BASE_DELAY", 2.0)
+# Multimodal calls (many images) often need more than the default gRPC deadline.
+GEMINI_TIMEOUT_SECONDS = _get_env_float("GEMINI_TIMEOUT_SECONDS", 300.0)
 GEMINI_IMAGE_BATCH_SIZE = max(1, _get_env_int("GEMINI_IMAGE_BATCH_SIZE", 3))
+# Text-only synthesis (batch merge, morning report) can be large; allow a separate ceiling.
+GEMINI_SYNTHESIS_TIMEOUT_SECONDS = _get_env_float(
+    "GEMINI_SYNTHESIS_TIMEOUT_SECONDS",
+    max(GEMINI_TIMEOUT_SECONDS, 600.0),
+)
+GEMINI_SYNTHESIS_CHUNK_SIZE = max(2, _get_env_int("GEMINI_SYNTHESIS_CHUNK_SIZE", 4))
+# If > 0: when image count >= this, skip the single all-images request and use batches first
+# (avoids wasted retries when Gemini often times out on large multimodal payloads).
+GEMINI_DIRECT_BATCH_MIN_IMAGES = max(0, _get_env_int("GEMINI_DIRECT_BATCH_MIN_IMAGES", 0))
 model = genai.GenerativeModel(VISION_MODEL_NAME)
 
 VOOM_IMAGES_DIR = "voom_images"
@@ -88,9 +96,6 @@ NOTION_PARENT_PAGE_AFTER_HOURS = os.getenv("NOTION_PARENT_PAGE_AFTER_HOURS_URL")
 NOTION_VERSION = "2022-06-28"
 NOTION_BLOCK_LIMIT = 100
 NOTION_APPEND_BATCH_SIZE = 50
-NOTION_RETRY_STATUSES = {429, 502, 503, 504}
-NOTION_MAX_RETRIES = 3
-NOTION_RETRY_BASE_DELAY = 1.0
 
 MODE_PREFIX_MAP = {
     "1": "morning",
@@ -147,29 +152,21 @@ def _notion_headers():
 
 
 def _notion_request(method, url, payload):
-    for attempt in range(NOTION_MAX_RETRIES + 1):
-        resp = requests.request(
+    resp = requests.request(
+        method,
+        url,
+        headers=_notion_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        snippet = (resp.text or "")[:800]
+        logger.error(
+            "Notion API 失敗：%s %s — %s",
             method,
-            url,
-            headers=_notion_headers(),
-            json=payload,
-            timeout=30,
+            resp.status_code,
+            snippet,
         )
-        if resp.status_code < 400:
-            return resp
-        if resp.status_code not in NOTION_RETRY_STATUSES:
-            return resp
-        if attempt >= NOTION_MAX_RETRIES:
-            return resp
-        retry_after = resp.headers.get("Retry-After")
-        if retry_after:
-            try:
-                delay = float(retry_after)
-            except ValueError:
-                delay = NOTION_RETRY_BASE_DELAY * (2 ** attempt)
-        else:
-            delay = NOTION_RETRY_BASE_DELAY * (2 ** attempt)
-        time.sleep(delay)
     return resp
 
 
@@ -469,7 +466,10 @@ def _extract_generation_text_or_raise(response, context):
     )
 
 
-def _generate_gemini_response(parts):
+def _generate_gemini_response(parts, timeout_seconds=None):
+    deadline = (
+        GEMINI_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+    )
     request = model._prepare_request(
         contents=parts,
         generation_config=None,
@@ -480,33 +480,80 @@ def _generate_gemini_response(parts):
     if model._client is None:
         model._client = genai_client.get_default_generative_client()
 
-    last_err = None
-    for attempt in range(GEMINI_MAX_RETRIES + 1):
-        try:
-            raw_response = model._client.generate_content(
-                request=request,
-                timeout=GEMINI_TIMEOUT_SECONDS,
-            )
-            return generation_types.GenerateContentResponse.from_response(raw_response)
-        except (
-            google_exceptions.DeadlineExceeded,
-            google_exceptions.InternalServerError,
-            google_exceptions.ServiceUnavailable,
-        ) as err:
-            last_err = err
-            if attempt >= GEMINI_MAX_RETRIES:
-                raise
-            delay = GEMINI_RETRY_BASE_DELAY * (2 ** attempt)
-            logger.warning(
-                "Gemini request failed with %s; retrying in %.1fs (%s/%s)",
-                type(err).__name__,
-                delay,
-                attempt + 1,
-                GEMINI_MAX_RETRIES,
-            )
-            time.sleep(delay)
+    try:
+        raw_response = model._client.generate_content(
+            request=request,
+            timeout=deadline,
+        )
+        return generation_types.GenerateContentResponse.from_response(raw_response)
+    except Exception as err:
+        logger.error("Gemini 請求失敗：%s", _format_exception(err))
+        raise
 
-    raise last_err
+
+_INTERMEDIATE_ANALYSIS_MERGE_PROMPT = (
+    "The following sections are partial analyses of the same LINE VOOM image post "
+    "(from different image batches). Merge them into one coherent analysis. "
+    "Preserve every grounded fact; remove duplication; do not invent details. "
+    "Do not mention batches, merging, or missing images.\n\n"
+)
+
+
+def _merge_partial_analysis_strings(texts):
+    """Merge multiple analysis fragments; on deadline, split and merge recursively."""
+    if len(texts) == 1:
+        return texts[0]
+    body = _INTERMEDIATE_ANALYSIS_MERGE_PROMPT + "\n\n---\n\n".join(texts)
+    try:
+        response = _generate_gemini_response(
+            [body],
+            timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
+        )
+        return _extract_generation_text_or_raise(response, "intermediate batch merge")
+    except google_exceptions.DeadlineExceeded:
+        if len(texts) <= 2:
+            raise
+        mid = len(texts) // 2
+        left = _merge_partial_analysis_strings(texts[:mid])
+        right = _merge_partial_analysis_strings(texts[mid:])
+        return _merge_partial_analysis_strings([left, right])
+
+
+def _build_batch_synthesis_prompt(reports, full_prompt):
+    return (
+        "The following are partial outputs from multiple image batches of the same LINE VOOM post.\n"
+        "Combine them into one single output that follows the original instructions.\n"
+        "Do not mention batching, missing images, or the analysis process.\n"
+        "Remove duplication and keep only grounded details.\n\n"
+        f"Original instructions:\n{full_prompt}\n\n"
+        "Partial analyses:\n"
+        f"{chr(10).join(reports)}"
+    )
+
+
+def _synthesize_batch_reports(batch_reports, full_prompt):
+    """Apply original instructions to merged batch outputs; shrink payload if Gemini times out."""
+    reports = list(batch_reports)
+    while True:
+        synthesis_prompt = _build_batch_synthesis_prompt(reports, full_prompt)
+        try:
+            response = _generate_gemini_response(
+                [synthesis_prompt],
+                timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
+            )
+            return _extract_generation_text_or_raise(response, "batch synthesis")
+        except google_exceptions.DeadlineExceeded:
+            if len(reports) <= 1:
+                raise
+            folded = []
+            chunk = GEMINI_SYNTHESIS_CHUNK_SIZE
+            for i in range(0, len(reports), chunk):
+                group = reports[i : i + chunk]
+                if len(group) == 1:
+                    folded.append(group[0])
+                else:
+                    folded.append(_merge_partial_analysis_strings(group))
+            reports = folded
 
 
 def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
@@ -540,24 +587,31 @@ def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
     if len(batch_reports) == 1:
         return batch_reports[0]
 
-    synthesis_prompt = (
-        "The following are partial outputs from multiple image batches of the same LINE VOOM post.\n"
-        "Combine them into one single output that follows the original instructions.\n"
-        "Do not mention batching, missing images, or the analysis process.\n"
-        "Remove duplication and keep only grounded details.\n\n"
-        f"Original instructions:\n{full_prompt}\n\n"
-        "Partial analyses:\n"
-        f"{chr(10).join(batch_reports)}"
-    )
-    synthesis_response = _generate_gemini_response([synthesis_prompt])
-    return _extract_generation_text_or_raise(synthesis_response, "batch synthesis")
+    return _synthesize_batch_reports(batch_reports, full_prompt)
 
 
-def _analyze_voom_images_with_retry(image_paths, prompt_template):
+def _analyze_voom_images_core(image_paths, prompt_template):
     if not image_paths:
         return "No VOOM images found."
 
     prompt, _ = _analysis_prompt(prompt_template, image_paths)
+
+    direct_batch = (
+        GEMINI_DIRECT_BATCH_MIN_IMAGES > 0
+        and len(image_paths) >= GEMINI_DIRECT_BATCH_MIN_IMAGES
+        and len(image_paths) > 1
+        and GEMINI_IMAGE_BATCH_SIZE < len(image_paths)
+    )
+    if direct_batch:
+        logger.info(
+            "Skipping single multimodal request (%s images >= GEMINI_DIRECT_BATCH_MIN_IMAGES=%s); "
+            "using batches of %s",
+            len(image_paths),
+            GEMINI_DIRECT_BATCH_MIN_IMAGES,
+            GEMINI_IMAGE_BATCH_SIZE,
+        )
+        return _analyze_voom_images_in_batches(image_paths, prompt_template, prompt)
+
     parts = [prompt]
     for path in image_paths:
         parts.append(_image_part(path))
@@ -613,11 +667,15 @@ def analyze_voom_images(image_paths, prompt_template):
 
 
 # Override the legacy implementation above with the timeout-aware path.
-analyze_voom_images = _analyze_voom_images_with_retry
+analyze_voom_images = _analyze_voom_images_core
 
 
 def _morning_prompt_from_facts(facts_text):
     return morning_report_prompt.replace("{facts_table}", facts_text.strip())
+
+
+def _after_hours_prompt_from_facts(facts_text):
+    return after_hours_report_prompt.replace("{facts_table}", facts_text.strip())
 
 
 def analyze_morning_voom_images(image_paths):
@@ -625,10 +683,28 @@ def analyze_morning_voom_images(image_paths):
     logger.info("Gemini extracted facts text length: %s", len(facts_text or ""))
 
     synthesis_prompt = _morning_prompt_from_facts(facts_text)
-    synthesis_response = _generate_gemini_response([synthesis_prompt])
+    synthesis_response = _generate_gemini_response(
+        [synthesis_prompt],
+        timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
+    )
     return _extract_generation_text_or_raise(
         synthesis_response,
         "morning report synthesis",
+    )
+
+
+def analyze_after_hours_voom_images(image_paths):
+    facts_text = analyze_voom_images(image_paths, extract_facts_prompt)
+    logger.info("Gemini extracted facts text length: %s", len(facts_text or ""))
+
+    synthesis_prompt = _after_hours_prompt_from_facts(facts_text)
+    synthesis_response = _generate_gemini_response(
+        [synthesis_prompt],
+        timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
+    )
+    return _extract_generation_text_or_raise(
+        synthesis_response,
+        "after hours report synthesis",
     )
 
 
@@ -709,8 +785,7 @@ def _process_voom_sync(url, mode):
     if mode == "morning":
         analysis_text = analyze_morning_voom_images(images)
     else:
-        prompt = _analysis_prompt_template(mode)
-        analysis_text = analyze_voom_images(images, prompt)
+        analysis_text = analyze_after_hours_voom_images(images)
     logger.info("Gemini analysis text length: %s", len(analysis_text or ""))
 
     analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
