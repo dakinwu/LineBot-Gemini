@@ -1,3 +1,4 @@
+from collections import deque
 from datetime import datetime
 import logging
 import mimetypes
@@ -12,7 +13,6 @@ import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
-from google.api_core import exceptions as google_exceptions
 import google.generativeai as genai
 from google.generativeai import client as genai_client
 from google.generativeai.types import generation_types
@@ -81,11 +81,21 @@ GEMINI_SYNTHESIS_TIMEOUT_SECONDS = _get_env_float(
     "GEMINI_SYNTHESIS_TIMEOUT_SECONDS",
     max(GEMINI_TIMEOUT_SECONDS, 600.0),
 )
-GEMINI_SYNTHESIS_CHUNK_SIZE = max(2, _get_env_int("GEMINI_SYNTHESIS_CHUNK_SIZE", 4))
+GEMINI_RATE_LIMIT_MAX_CALLS = max(1, _get_env_int("GEMINI_RATE_LIMIT_MAX_CALLS", 5))
+GEMINI_RATE_LIMIT_WINDOW_SECONDS = max(
+    1.0,
+    _get_env_float("GEMINI_RATE_LIMIT_WINDOW_SECONDS", 60.0),
+)
+GEMINI_RATE_LIMIT_SAFETY_SECONDS = max(
+    0.0,
+    _get_env_float("GEMINI_RATE_LIMIT_SAFETY_SECONDS", 0.25),
+)
 # If > 0: when image count >= this, skip the single all-images request and use batches first
 # (avoids wasted retries when Gemini often times out on large multimodal payloads).
 GEMINI_DIRECT_BATCH_MIN_IMAGES = max(0, _get_env_int("GEMINI_DIRECT_BATCH_MIN_IMAGES", 0))
 model = genai.GenerativeModel(VISION_MODEL_NAME)
+_gemini_rate_lock = threading.Lock()
+_gemini_call_starts = deque()
 
 VOOM_IMAGES_DIR = "voom_images"
 MAX_VOOM_IMAGES = _get_env_int("MAX_VOOM_IMAGES")
@@ -466,6 +476,35 @@ def _extract_generation_text_or_raise(response, context):
     )
 
 
+def _wait_for_gemini_rate_slot():
+    while True:
+        with _gemini_rate_lock:
+            now = time.monotonic()
+            window_start = now - GEMINI_RATE_LIMIT_WINDOW_SECONDS
+            while _gemini_call_starts and _gemini_call_starts[0] <= window_start:
+                _gemini_call_starts.popleft()
+
+            if len(_gemini_call_starts) < GEMINI_RATE_LIMIT_MAX_CALLS:
+                _gemini_call_starts.append(now)
+                return
+
+            oldest = _gemini_call_starts[0]
+            wait_seconds = (
+                GEMINI_RATE_LIMIT_WINDOW_SECONDS
+                - (now - oldest)
+                + GEMINI_RATE_LIMIT_SAFETY_SECONDS
+            )
+
+        wait_seconds = max(wait_seconds, 0.1)
+        logger.info(
+            "Gemini rate limit reached (%s calls / %.1fs); waiting %.1fs",
+            GEMINI_RATE_LIMIT_MAX_CALLS,
+            GEMINI_RATE_LIMIT_WINDOW_SECONDS,
+            wait_seconds,
+        )
+        time.sleep(wait_seconds)
+
+
 def _generate_gemini_response(parts, timeout_seconds=None):
     deadline = (
         GEMINI_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -481,42 +520,16 @@ def _generate_gemini_response(parts, timeout_seconds=None):
         model._client = genai_client.get_default_generative_client()
 
     try:
+        _wait_for_gemini_rate_slot()
         raw_response = model._client.generate_content(
             request=request,
+            retry=None,
             timeout=deadline,
         )
         return generation_types.GenerateContentResponse.from_response(raw_response)
     except Exception as err:
         logger.error("Gemini 請求失敗：%s", _format_exception(err))
         raise
-
-
-_INTERMEDIATE_ANALYSIS_MERGE_PROMPT = (
-    "The following sections are partial analyses of the same LINE VOOM image post "
-    "(from different image batches). Merge them into one coherent analysis. "
-    "Preserve every grounded fact; remove duplication; do not invent details. "
-    "Do not mention batches, merging, or missing images.\n\n"
-)
-
-
-def _merge_partial_analysis_strings(texts):
-    """Merge multiple analysis fragments; on deadline, split and merge recursively."""
-    if len(texts) == 1:
-        return texts[0]
-    body = _INTERMEDIATE_ANALYSIS_MERGE_PROMPT + "\n\n---\n\n".join(texts)
-    try:
-        response = _generate_gemini_response(
-            [body],
-            timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
-        )
-        return _extract_generation_text_or_raise(response, "intermediate batch merge")
-    except google_exceptions.DeadlineExceeded:
-        if len(texts) <= 2:
-            raise
-        mid = len(texts) // 2
-        left = _merge_partial_analysis_strings(texts[:mid])
-        right = _merge_partial_analysis_strings(texts[mid:])
-        return _merge_partial_analysis_strings([left, right])
 
 
 def _build_batch_synthesis_prompt(reports, full_prompt):
@@ -532,28 +545,13 @@ def _build_batch_synthesis_prompt(reports, full_prompt):
 
 
 def _synthesize_batch_reports(batch_reports, full_prompt):
-    """Apply original instructions to merged batch outputs; shrink payload if Gemini times out."""
-    reports = list(batch_reports)
-    while True:
-        synthesis_prompt = _build_batch_synthesis_prompt(reports, full_prompt)
-        try:
-            response = _generate_gemini_response(
-                [synthesis_prompt],
-                timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
-            )
-            return _extract_generation_text_or_raise(response, "batch synthesis")
-        except google_exceptions.DeadlineExceeded:
-            if len(reports) <= 1:
-                raise
-            folded = []
-            chunk = GEMINI_SYNTHESIS_CHUNK_SIZE
-            for i in range(0, len(reports), chunk):
-                group = reports[i : i + chunk]
-                if len(group) == 1:
-                    folded.append(group[0])
-                else:
-                    folded.append(_merge_partial_analysis_strings(group))
-            reports = folded
+    """Apply original instructions to merged batch outputs."""
+    synthesis_prompt = _build_batch_synthesis_prompt(list(batch_reports), full_prompt)
+    response = _generate_gemini_response(
+        [synthesis_prompt],
+        timeout_seconds=GEMINI_SYNTHESIS_TIMEOUT_SECONDS,
+    )
+    return _extract_generation_text_or_raise(response, "batch synthesis")
 
 
 def _analyze_voom_images_in_batches(image_paths, prompt_template, full_prompt):
@@ -616,18 +614,8 @@ def _analyze_voom_images_core(image_paths, prompt_template):
     for path in image_paths:
         parts.append(_image_part(path))
 
-    try:
-        response = _generate_gemini_response(parts)
-        return _extract_generation_text_or_raise(response, "full image analysis")
-    except google_exceptions.DeadlineExceeded:
-        if len(image_paths) <= 1 or GEMINI_IMAGE_BATCH_SIZE >= len(image_paths):
-            raise
-        logger.warning(
-            "Gemini timed out for %s images; falling back to batches of %s",
-            len(image_paths),
-            GEMINI_IMAGE_BATCH_SIZE,
-        )
-        return _analyze_voom_images_in_batches(image_paths, prompt_template, prompt)
+    response = _generate_gemini_response(parts)
+    return _extract_generation_text_or_raise(response, "full image analysis")
 
 
 def analyze_voom_images(image_paths, prompt_template):
@@ -641,7 +629,7 @@ def analyze_voom_images(image_paths, prompt_template):
     for path in image_paths:
         parts.append(_image_part(path))
 
-    response = model.generate_content(parts)
+    response = _generate_gemini_response(parts)
     try:
         return response.text.strip()
     except Exception:
