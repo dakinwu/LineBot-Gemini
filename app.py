@@ -30,6 +30,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import requests
 import uvicorn
 
+from market_data import build_market_context_text
 from prompts import after_hours_report_prompt, extract_facts_prompt, morning_report_prompt
 
 # Load environment variables
@@ -666,9 +667,30 @@ def _after_hours_prompt_from_facts(facts_text):
     return after_hours_report_prompt.replace("{facts_table}", facts_text.strip())
 
 
+def _facts_with_market_context(facts_text, mode):
+    facts_text = (facts_text or "").strip()
+    try:
+        market_context = build_market_context_text(mode=mode)
+    except Exception as err:
+        logger.exception("FinMind market context fetch failed")
+        market_context = (
+            "## 程式補充資料（FinMind API）\n"
+            f"- 資料狀態：FinMind 擷取失敗，{_format_exception(err)}。"
+        )
+
+    market_context = (market_context or "").strip()
+    if not market_context:
+        return facts_text
+    if not facts_text:
+        return market_context
+    return f"{facts_text}\n\n{market_context}"
+
+
 def analyze_morning_voom_images(image_paths):
     facts_text = analyze_voom_images(image_paths, extract_facts_prompt)
     logger.info("Gemini extracted facts text length: %s", len(facts_text or ""))
+    facts_text = _facts_with_market_context(facts_text, "morning")
+    logger.info("Facts text with FinMind context length: %s", len(facts_text or ""))
 
     synthesis_prompt = _morning_prompt_from_facts(facts_text)
     synthesis_response = _generate_gemini_response(
@@ -684,6 +706,8 @@ def analyze_morning_voom_images(image_paths):
 def analyze_after_hours_voom_images(image_paths):
     facts_text = analyze_voom_images(image_paths, extract_facts_prompt)
     logger.info("Gemini extracted facts text length: %s", len(facts_text or ""))
+    facts_text = _facts_with_market_context(facts_text, "after_hours")
+    logger.info("Facts text with FinMind context length: %s", len(facts_text or ""))
 
     synthesis_prompt = _after_hours_prompt_from_facts(facts_text)
     synthesis_response = _generate_gemini_response(
