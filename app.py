@@ -73,7 +73,7 @@ _line_bot_api = MessagingApi(_line_api_client)
 
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-VISION_MODEL_NAME = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+VISION_MODEL_NAME = os.getenv("GEMINI_VISION_MODEL", "gemini-3-flash-preview")
 # Multimodal calls (many images) often need more than the default gRPC deadline.
 GEMINI_TIMEOUT_SECONDS = _get_env_float("GEMINI_TIMEOUT_SECONDS", 300.0)
 GEMINI_IMAGE_BATCH_SIZE = max(1, _get_env_int("GEMINI_IMAGE_BATCH_SIZE", 3))
