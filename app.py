@@ -840,8 +840,6 @@ async def callback(request: Request):
 def handle_message(event):
     """Handle incoming text messages."""
     user_message = event.message.text.strip()
-    print(f"[debug] User message raw: {event.message.text!r}", flush=True)
-    print(f"[debug] User message stripped: {user_message!r}", flush=True)
     mode, content_text = _detect_report_mode(user_message)
     print(f"[debug] Report mode: {mode!r}", flush=True)
     url = _extract_first_url(content_text)

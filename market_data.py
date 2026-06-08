@@ -246,7 +246,8 @@ def _build_taiex_intraday_line(client: FinMindClient, end_day) -> str | None:
         latest = rows[-1]
         taiex = _to_float(latest.get("TAIEX"))
         return (
-            "- 加權指數取樣（TaiwanVariousIndicators5Seconds）："
+            "- 加權價格指數取樣（TaiwanVariousIndicators5Seconds，"
+            "盤中或最新取樣，非報酬指數均線資料）："
             f"{latest.get('date')} TAIEX {_fmt_num(taiex)}。[FinMind]"
         )
     return None
@@ -275,7 +276,8 @@ def _build_total_return_index_line(
     pct = (change / previous * 100) if previous else None
     closes = [item[1] for item in values]
     return (
-        f"- {label}：{day} 收 {_fmt_num(close)}，"
+        f"- {label}（TaiwanStockTotalReturnIndex，報酬指數口徑）："
+        f"{day} 收 {_fmt_num(close)}，"
         f"日變動 {_fmt_signed(change)} ({_fmt_signed(pct)}%)，"
         f"{_price_position(close, closes)}，"
         f"SMA5趨勢 {_sma_trend(closes, 5)}、SMA10趨勢 {_sma_trend(closes, 10)}、"
@@ -291,6 +293,10 @@ def _build_index_section(
     warnings: list[str],
 ) -> list[str]:
     lines = ["### 台灣指數與市場狀態"]
+    lines.append(
+        "- 指標口徑：加權價格指數取樣只可描述 TAIEX 取樣值；"
+        "TAIEX TR 與 TPEx TR 為報酬指數序列，其 SMA 僅適用於報酬指數本身。[FinMind]"
+    )
     try:
         intraday = _build_taiex_intraday_line(client, end_day)
         if intraday:
@@ -503,6 +509,8 @@ def build_market_context_text(mode: str = "morning") -> str:
         f"- 擷取時間：{now.strftime('%Y-%m-%d %H:%M')} Asia/Taipei；"
         f"查詢區間：{start_date} 至 {end_date}。",
         "- 使用規則：以下為程式直接查詢的結構化資料；若與圖片抽取資料衝突，請標示分歧，不要自行改寫成不存在的事實。",
+        "- 指標口徑：TaiwanVariousIndicators5Seconds = 加權價格指數盤中或最新取樣；TaiwanStockTotalReturnIndex = 報酬指數收盤序列。不同口徑不得直接比較點位、支撐、壓力或均線。[FinMind]",
+        "- 分歧規則：只有同一日期、同一指標、同一市場別、同一資料口徑的數值不同才是資料來源分歧；不同日期或不同口徑請寫成日期或指標口徑不同。[FinMind]",
     ]
     if not client.token:
         lines.append("- API 狀態：未設定 FINMIND_API_TOKEN，使用匿名額度。[FinMind]")
